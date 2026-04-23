@@ -1820,8 +1820,7 @@ class FlashAttentionForwardSm100:
             tScS_coord = None
             if const_expr(col_bias is not None):
                 # --- 1. slice per head / batch (const_expr rank dispatch) ---
-                #col_bias_rank = const_expr(col_bias.rank)
-                col_bias_rank = const_expr(cute.rank(col_bias))
+                col_bias_rank = const_expr(col_bias.rank)
                 kv_head = (
                     head_idx // self.qhead_per_kvhead
                     if const_expr(not self.pack_gqa)
@@ -1839,9 +1838,13 @@ class FlashAttentionForwardSm100:
                     col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
 
                 # --- 3. coordinate tensor: built once, reused every n_block ---
-                # Use the same identity-tensor + partition_C that softmax_step would
-                # otherwise rebuild on every call.
-                _cS_bias = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+                # MUST use mma_tiler_qk[:2] = (cta_group_size * m_block_size, n_block_size)
+                # as the identity tensor shape — exactly matching what softmax_step does.
+                # Using m_block_size instead gives wrong N-coords with 2CTA (cta_group_size=2)
+                # because partition_C distributes elements differently over the larger M extent.
+                # With a constant bias this bug is hidden; with a non-constant bias it gives
+                # wrong results because each element reads the wrong column of the bias.
+                _cS_bias = cute.make_identity_tensor(self.mma_tiler_qk[:2])
                 tScS_coord = thr_mma_qk.partition_C(_cS_bias)[(None, None), 0, 0]
 
             # Build softmax_step partial with pre-hoisted col_bias tensors
