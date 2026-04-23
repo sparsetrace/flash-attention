@@ -1653,7 +1653,7 @@ class FlashAttentionForwardSm100:
             # 1. Select the right slice of col_bias based on its rank.
             #    All rank checks are const_expr so dead branches are eliminated.
             # ------------------------------------------------------------------
-            col_bias_rank = const_expr(col_bias.rank)
+            col_bias_rank = const_expr(cute.rank(col_bias))
 
             if const_expr(col_bias_rank == 3):
                 # (b, h_k, seqlen_k) -> slice batch and head
