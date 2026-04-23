@@ -2160,14 +2160,14 @@ class FlashAttentionForwardSm100:
                 seqlen,
             )
 
-    # Need a barrier here so all softmax threads see sColBias populated
-    cute.arch.barrier()
-
-    self._add_col_bias(
-        tSrS_t2r,
-        tScS_t2r,
-        sColBias,
-    )
+            # Need a barrier here so all softmax threads see sColBias populated
+            cute.arch.barrier()
+        
+            self._add_col_bias(
+                tSrS_t2r,
+                tScS_t2r,
+                sColBias,
+            )
 
         # 4. score_mod (optional learnable per-element transform)
         if cutlass.const_expr(self.score_mod is not None):
