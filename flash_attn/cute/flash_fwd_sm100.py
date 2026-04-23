@@ -1609,33 +1609,18 @@ class FlashAttentionForwardSm100:
     def _add_col_bias(
         self,
         tSrS_t2r: cute.Tensor,
-        tScS_mma: cute.Tensor,       # thr_mma_qk.partition_C(identity)[(None,None),0,0]
-                                     # NOT partition_D — the tmem load atom reorders M only,
-                                     # not N, so N-coords are identical before/after partition_D.
-                                     # Using partition_C alone gives a fully static layout so
-                                     # tScS_mma[k][1] is a compile-time constant after
-                                     # range_constexpr unroll, enabling ptxas CSE of bias loads.
-        col_bias_seq: cute.Tensor,   # rank-1 (seqlen_k,) already sliced+offset per work-tile
+        tScS_t2r: cute.Tensor,
+        col_bias_seq: cute.Tensor,
         n_block: Int32,
-    ):
-        """Add per-column bias to score fragment.
-
-        col_bias_seq is pre-sliced per head/batch and varlen-offset once per
-        work-tile in softmax_loop (not per n_block).
-
-        The N-coordinate for element k is tScS_mma[k][1].  Because tScS_mma
-        comes from partition_C on a static identity tensor (no runtime tidx in
-        the layout), this is a compile-time constant after range_constexpr
-        unroll.  ptxas therefore CSEs all bias loads for the same N-column
-        (~4 unique N-coords per thread for a 128x128 tile with 128 threads),
-        giving ~4 gmem loads instead of 128.
-        """
+        ):
         bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
-
-        for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
-            n_coord = tScS_mma[k][1]              # compile-time constant
-            bias_val = Float32(bias_tile[n_coord]) # CSE'd by ptxas: ~4 loads total
-            tSrS_t2r[k] = tSrS_t2r[k] + bias_val
+    
+        for n in cutlass.range_constexpr(self.n_block_size):
+            bias_val = Float32(bias_tile[n])
+    
+            for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
+                if const_expr(tScS_t2r[k][1] == n):
+                    tSrS_t2r[k] = tSrS_t2r[k] + bias_val
 
     @cute.jit
     def softmax_loop(
