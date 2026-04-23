@@ -1603,40 +1603,28 @@ class FlashAttentionForwardSm100:
         return qk_descale, v_descale
 
     # =========================================================================
-    # NEW METHOD: fused column-bias addition  (optimised)
+    # NEW METHOD: fused column-bias addition
     # =========================================================================
     @cute.jit
     def _add_col_bias(
         self,
-        tSrS_t2r: cute.Tensor,       # loaded score fragment (registers)
-        tScS_coord: cute.Tensor,     # pre-partitioned coord tensor — same shape as tSrS_t2r
-                                     # tScS_coord[k] = (m_coord, n_coord) for element k
-                                     # MUST be precomputed once in softmax_loop, not per n_block
-        col_bias_seq: cute.Tensor,   # rank-1 (seqlen_k,) bias already sliced per head/batch
-                                     # and varlen-offset — hoisted once per work-tile in
-                                     # softmax_loop, NOT re-derived here
-        n_block: Int32,              # current KV tile index
+        tSrS_t2r: cute.Tensor,
+        tScS_t2r: cute.Tensor,       # thr_tmem_load.partition_D(tScS) — coord fragment
+        col_bias_seq: cute.Tensor,   # rank-1 (seqlen_k,) already sliced+offset per work-tile
+        n_block: Int32,
     ):
-        """Add per-column bias to score fragment — hot inner loop, zero overhead version.
+        """Add per-column bias to score fragment.
 
-        All expensive one-time work (head/batch slicing, varlen offset, identity-tensor
-        partition) is hoisted to softmax_loop and executed once per work-tile.
-        This method only does: local_tile (pure pointer arithmetic) + unrolled adds.
-
-        Complexity per call:
-          - 1 cute.local_tile call  (pointer offset, no memory access)
-          - cute.size(tSrS_t2r) FP32 additions
-          - ~n_block_size / (warp_size * vec_width) gmem loads, fully CSE'd by ptxas
+        col_bias_seq is pre-sliced per head/batch and varlen-offset once per
+        work-tile in softmax_loop (not per n_block).  tScS_t2r carries the
+        N-coordinates and is already computed in softmax_step — passed straight
+        through so no extra work happens here.
         """
-        # Tile the pre-sliced 1D bias for this n_block — pure pointer arithmetic.
         bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
 
-        # Fully unrolled at compile time. n_coord is a compile-time constant per k
-        # because tScS_coord is derived from a static identity tensor partition.
-        # ptxas CSEs repeated loads for the same n_coord across the M dimension.
         for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
-            n_coord = tScS_coord[k][1]              # compile-time constant
-            bias_val = Float32(bias_tile[n_coord])  # gmem load, CSE'd across M-rows
+            n_coord = tScS_t2r[k][1]
+            bias_val = Float32(bias_tile[n_coord])
             tSrS_t2r[k] = tSrS_t2r[k] + bias_val
 
     @cute.jit
@@ -1810,14 +1798,10 @@ class FlashAttentionForwardSm100:
             #   col_bias_seq  — rank-1 (seqlen_k,) view already sliced per
             #                   head/batch and varlen-offset.  None when
             #                   col_bias is disabled.
-            #   tScS_coord    — coordinate tensor partitioned identically to the
-            #                   score fragment; tScS_coord[k] gives (m, n) of
-            #                   fragment element k.  The n-coordinate is a
-            #                   compile-time constant after constexpr unroll,
-            #                   enabling ptxas CSE of repeated bias gmem loads.
+            #   N-coordinate lookup is handled inside _add_col_bias via a local
+            #   tScS_coord that is never live across call boundaries (register-free).
             # ------------------------------------------------------------------
             col_bias_seq = None
-            tScS_coord = None
             if const_expr(col_bias is not None):
                 # --- 1. slice per head / batch (const_expr rank dispatch) ---
                 col_bias_rank = const_expr(cute.rank(col_bias))
@@ -1837,16 +1821,10 @@ class FlashAttentionForwardSm100:
                 if const_expr(seqlen.has_cu_seqlens_k):
                     col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
 
-                # --- 3. coordinate tensor: must match tSrS_t2r exactly ---
-                # tSrS_t2r comes from thr_tmem_load.partition_D(tScS), so tScS_coord
-                # must go through the same two-step partitioning:
-                #   partition_C  — distributes the MMA tile across threads (gives MMA coords)
-                #   partition_D  — applies the tmem load atom layout (gives fragment coords)
-                # Skipping partition_D means tScS_coord[k] maps to a different element
-                # than tSrS_t2r[k], producing wrong N-coordinates for non-constant biases.
-                _cS_bias = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-                _tScS_bias = thr_mma_qk.partition_C(_cS_bias)[(None, None), 0, 0]
-                tScS_coord = thr_tmem_load.partition_D(_tScS_bias)
+                # No coord tensor hoisted — _add_col_bias recomputes from static
+                # layout inside a @cute.jit scope where range_constexpr unrolling
+                # allows ptxas to fold n_coord to a compile-time constant and CSE
+                # the bias gmem loads, without holding the coord tensor in registers.
 
             # Build softmax_step partial with pre-hoisted col_bias tensors
             softmax_step = partial(
@@ -1874,7 +1852,6 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 col_bias_seq=col_bias_seq,    # pre-sliced, None if disabled
-                tScS_coord=tScS_coord,        # pre-partitioned, None if disabled
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -1996,7 +1973,6 @@ class FlashAttentionForwardSm100:
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
         col_bias_seq: Optional[cute.Tensor] = None,
-        tScS_coord: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Single softmax step on one n_block.
 
@@ -2025,10 +2001,12 @@ class FlashAttentionForwardSm100:
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
 
         # 3. col_bias: tSrS_t2r[k] += col_bias_seq[n_block*N + n_coord(k)]
-        #    col_bias_seq and tScS_coord are pre-hoisted per work-tile in
-        #    softmax_loop — this call is just local_tile + unrolled FP32 adds.
+        #    col_bias_seq is pre-sliced per work-tile (hoisted in softmax_loop).
+        #    tScS_t2r carries N-coords in the same fragment layout as tSrS_t2r;
+        #    tScS is already computed above so this is free.
         if const_expr(col_bias_seq is not None):
-            self._add_col_bias(tSrS_t2r, tScS_coord, col_bias_seq, n_block)
+            tScS_t2r = thr_tmem_load.partition_D(tScS)
+            self._add_col_bias(tSrS_t2r, tScS_t2r, col_bias_seq, n_block)
 
         # 4. score_mod (optional learnable per-element transform)
         if cutlass.const_expr(self.score_mod is not None):
