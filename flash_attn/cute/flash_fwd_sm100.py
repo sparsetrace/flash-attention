@@ -1624,31 +1624,26 @@ class FlashAttentionForwardSm100:
             kv_head = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
     
             if const_expr(col_bias_rank == 3):
-                # (b, h_k, seqlen_k) -> (seqlen_k,)
-                col_bias_seq = col_bias[batch_idx, kv_head]
+                col_bias_seq = col_bias[batch_idx, kv_head, None]
             elif const_expr(col_bias_rank == 2):
-                # (h_k, seqlen_k) -> (seqlen_k,)
-                col_bias_seq = col_bias[kv_head]
+                col_bias_seq = col_bias[kv_head, None]
             else:
-                # (seqlen_k,)
                 col_bias_seq = col_bias
     
             if const_expr(seqlen.has_cu_seqlens_k):
                 col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
     
-            # local tile for this n_block
             bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
     
-            # IMPORTANT: map coordinates using the same partitioning as the loaded fragment
             cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
             tScS = thr_mma_qk.partition_C(cS)
             tScS = tScS[(None, None), 0, 0]
             tScS_t2r = thr_tmem_load.partition_D(tScS)
     
             for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
-                n_coord = tScS_t2r[k][1]              # tile-local column coord
+                n_coord = tScS_t2r[k][1]
                 bias_val = Float32(bias_tile[n_coord])
-                tSrS_t2r[k] = tSrS_t2r[k] + bias_val    
+                tSrS_t2r[k] = tSrS_t2r[k] + bias_val
     
     @cute.jit
     def _add_col_biasX(
