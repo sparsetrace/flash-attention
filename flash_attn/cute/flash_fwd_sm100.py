@@ -1607,41 +1607,41 @@ class FlashAttentionForwardSm100:
     # NEW METHOD: fused column-bias addition
     # =========================================================================
 
-  @cute.jit
-  def _load_col_bias_tile(
-      self,
-      sColBias: cute.Tensor,   # shape (self.n_block_size,), Float32 in shared memory
-      col_bias: cute.Tensor,
-      batch_idx: Int32,
-      head_idx: Int32,
-      n_block: Int32,
-      seqlen,
-  ):
-      if const_expr(col_bias is not None):
-          col_bias_rank = const_expr(cute.rank(col_bias))
-          kv_head = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
-  
-          if const_expr(col_bias_rank == 3):
-              col_bias_seq = col_bias[batch_idx, kv_head, None]
-          elif const_expr(col_bias_rank == 2):
-              col_bias_seq = col_bias[kv_head, None]
-          else:
-              col_bias_seq = col_bias
-  
-          if const_expr(seqlen.has_cu_seqlens_k):
-              col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
-  
-          bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
-  
-          # 4 softmax warps = 128 threads, so for n_block_size=128 each thread loads one value.
-          lane_idx = cute.arch.make_warp_uniform(cute.arch.lane_idx())
-          warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-          softmax_warp_idx = warp_idx % 4
-          tid_in_softmax_group = softmax_warp_idx * 32 + lane_idx
-  
-          # General form for 64 / 96 / 128
-          for j in cutlass.range_constexpr(tid_in_softmax_group, self.n_block_size, 128):
-              sColBias[j] = Float32(bias_tile[j])
+    @cute.jit
+    def _load_col_bias_tile(
+        self,
+        sColBias: cute.Tensor,   # shape (self.n_block_size,), Float32 in shared memory
+        col_bias: cute.Tensor,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        seqlen,
+        ):
+        if const_expr(col_bias is not None):
+            col_bias_rank = const_expr(cute.rank(col_bias))
+            kv_head = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+    
+            if const_expr(col_bias_rank == 3):
+                col_bias_seq = col_bias[batch_idx, kv_head, None]
+            elif const_expr(col_bias_rank == 2):
+                col_bias_seq = col_bias[kv_head, None]
+            else:
+                col_bias_seq = col_bias
+    
+            if const_expr(seqlen.has_cu_seqlens_k):
+                col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
+    
+            bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
+    
+            # 4 softmax warps = 128 threads, so for n_block_size=128 each thread loads one value.
+            lane_idx = cute.arch.make_warp_uniform(cute.arch.lane_idx())
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            softmax_warp_idx = warp_idx % 4
+            tid_in_softmax_group = softmax_warp_idx * 32 + lane_idx
+    
+            # General form for 64 / 96 / 128
+            for j in cutlass.range_constexpr(tid_in_softmax_group, self.n_block_size, 128):
+                sColBias[j] = Float32(bias_tile[j])
 
     @cute.jit
     def _add_col_bias(
