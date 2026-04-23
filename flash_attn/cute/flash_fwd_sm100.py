@@ -1837,15 +1837,16 @@ class FlashAttentionForwardSm100:
                 if const_expr(seqlen.has_cu_seqlens_k):
                     col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
 
-                # --- 3. coordinate tensor: built once, reused every n_block ---
-                # MUST use mma_tiler_qk[:2] = (cta_group_size * m_block_size, n_block_size)
-                # as the identity tensor shape — exactly matching what softmax_step does.
-                # Using m_block_size instead gives wrong N-coords with 2CTA (cta_group_size=2)
-                # because partition_C distributes elements differently over the larger M extent.
-                # With a constant bias this bug is hidden; with a non-constant bias it gives
-                # wrong results because each element reads the wrong column of the bias.
+                # --- 3. coordinate tensor: must match tSrS_t2r exactly ---
+                # tSrS_t2r comes from thr_tmem_load.partition_D(tScS), so tScS_coord
+                # must go through the same two-step partitioning:
+                #   partition_C  — distributes the MMA tile across threads (gives MMA coords)
+                #   partition_D  — applies the tmem load atom layout (gives fragment coords)
+                # Skipping partition_D means tScS_coord[k] maps to a different element
+                # than tSrS_t2r[k], producing wrong N-coordinates for non-constant biases.
                 _cS_bias = cute.make_identity_tensor(self.mma_tiler_qk[:2])
-                tScS_coord = thr_mma_qk.partition_C(_cS_bias)[(None, None), 0, 0]
+                _tScS_bias = thr_mma_qk.partition_C(_cS_bias)[(None, None), 0, 0]
+                tScS_coord = thr_tmem_load.partition_D(_tScS_bias)
 
             # Build softmax_step partial with pre-hoisted col_bias tensors
             softmax_step = partial(
