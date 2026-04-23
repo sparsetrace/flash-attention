@@ -519,7 +519,17 @@ def _flash_attn_fwd(
     # col_bias must be contiguous on last dim — ensure that here.
     # ------------------------------------------------------------------
     if col_bias is not None:
+        # Accept fp16/bf16/fp32 from the caller, but normalize to fp32 for the
+        # score/softmax path before validation and kernel launch.
+        assert col_bias.dtype in (torch.float16, torch.bfloat16, torch.float32), (
+            f"col_bias must be float16, bfloat16, or float32, got {col_bias.dtype}"
+        )
+        if not is_fake_mode():
+            assert col_bias.is_cuda, "col_bias must be on CUDA"
+    
+        col_bias = col_bias.to(device=q.device, dtype=torch.float32)
         col_bias = col_bias.contiguous() if col_bias.stride(-1) != 1 else col_bias
+    
         _validate_col_bias(
             col_bias,
             batch_size=batch_size,
