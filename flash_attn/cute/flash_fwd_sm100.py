@@ -1610,20 +1610,36 @@ class FlashAttentionForwardSm100:
     def _add_col_bias(
         self,
         tSrS_t2r: cute.Tensor,
-        thr_tmem_load,
-        thr_mma_qk: cute.core.ThrMma,
+        tScS_t2r: cute.Tensor,
         col_bias: cute.Tensor,
         batch_idx: Int32,
         head_idx: Int32,
         n_block: Int32,
         seqlen,
     ):
+        """Add per-column bias to the score fragment.
+    
+        Expects:
+          - tSrS_t2r: loaded score fragment for this thread
+          - tScS_t2r: matching coordinate fragment for tSrS_t2r
+                      so tScS_t2r[k] gives the logical (m_coord, n_coord)
+                      of tSrS_t2r[k]
+          - col_bias shapes:
+              rank 1: (seqlen_k,)
+              rank 2: (h_k, seqlen_k)
+              rank 3: (b, h_k, seqlen_k)
+    
+        Semantics:
+            S_ij += bias_j
+        """
         if const_expr(col_bias is not None):
             col_bias_rank = const_expr(cute.rank(col_bias))
     
             kv_head = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
     
             if const_expr(col_bias_rank == 3):
+                # Keep the trailing None so CuTe treats this as a rank-1 tensor view,
+                # not a scalar load.
                 col_bias_seq = col_bias[batch_idx, kv_head, None]
             elif const_expr(col_bias_rank == 2):
                 col_bias_seq = col_bias[kv_head, None]
@@ -1633,17 +1649,15 @@ class FlashAttentionForwardSm100:
             if const_expr(seqlen.has_cu_seqlens_k):
                 col_bias_seq = cute.domain_offset((seqlen.offset_k,), col_bias_seq)
     
+            # Tile the 1D bias sequence for this N block
             bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
     
-            cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-            tScS = thr_mma_qk.partition_C(cS)
-            tScS = tScS[(None, None), 0, 0]
-            tScS_t2r = thr_tmem_load.partition_D(tScS)
-    
+            # Use the exact logical N coordinate that corresponds to each loaded
+            # fragment entry in tSrS_t2r.
             for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
                 n_coord = tScS_t2r[k][1]
                 bias_val = Float32(bias_tile[n_coord])
-                tSrS_t2r[k] = tSrS_t2r[k] + bias_val
+                tSrS_t2r[k] = tSrS_t2r[k] + bias_val 
     
     @cute.jit
     def _add_col_biasX(
