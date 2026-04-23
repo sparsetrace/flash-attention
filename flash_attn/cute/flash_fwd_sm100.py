@@ -1820,7 +1820,8 @@ class FlashAttentionForwardSm100:
             tScS_coord = None
             if const_expr(col_bias is not None):
                 # --- 1. slice per head / batch (const_expr rank dispatch) ---
-                col_bias_rank = const_expr(col_bias.rank)
+                #col_bias_rank = const_expr(col_bias.rank)
+                col_bias_rank = const_expr(cute.rank(col_bias))
                 kv_head = (
                     head_idx // self.qhead_per_kvhead
                     if const_expr(not self.pack_gqa)
