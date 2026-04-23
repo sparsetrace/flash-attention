@@ -1612,15 +1612,22 @@ class FlashAttentionForwardSm100:
         tScS_t2r: cute.Tensor,
         col_bias_seq: cute.Tensor,
         n_block: Int32,
-        ):
+    ):
+        """Add per-column bias to score fragment.
+
+        col_bias_seq is pre-sliced per head/batch and varlen-offset once per
+        work-tile in softmax_loop (not per n_block).  tScS_t2r carries the
+        correct N-coordinates via partition_D.
+
+        The bias tile is only 128 floats = 512 bytes.  After the first n_block
+        step it lives in L2/L1 and subsequent loads are ~fast.  The 128 loads
+        per step are the irreducible minimum given a runtime n_coord.
+        """
         bias_tile = cute.local_tile(col_bias_seq, (self.n_block_size,), (n_block,))
-    
-        for n in cutlass.range_constexpr(self.n_block_size):
-            bias_val = Float32(bias_tile[n])
-    
-            for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
-                if const_expr(tScS_t2r[k][1] == n):
-                    tSrS_t2r[k] = tSrS_t2r[k] + bias_val
+
+        for k in cutlass.range_constexpr(cute.size(tSrS_t2r)):
+            n_coord = tScS_t2r[k][1]
+            tSrS_t2r[k] = tSrS_t2r[k] + Float32(bias_tile[n_coord])
 
     @cute.jit
     def softmax_loop(
@@ -2003,7 +2010,8 @@ class FlashAttentionForwardSm100:
         #    way.  Using the pre-partition_D tensor gives compile-time N-coords,
         #    enabling ptxas CSE of the bias gmem loads.
         if const_expr(col_bias_seq is not None):
-            self._add_col_bias(tSrS_t2r, tScS, col_bias_seq, n_block)
+            tScS_t2r = thr_tmem_load.partition_D(tScS)
+            self._add_col_bias(tSrS_t2r, tScS_t2r, col_bias_seq, n_block)
 
         # 4. score_mod (optional learnable per-element transform)
         if cutlass.const_expr(self.score_mod is not None):
