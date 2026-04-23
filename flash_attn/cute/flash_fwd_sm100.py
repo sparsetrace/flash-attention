@@ -2097,15 +2097,16 @@ class FlashAttentionForwardSm100:
         #    This must happen BEFORE score_mod and masking so the bias is
         #    included in the row-max and the softmax is numerically correct.
         # ----------------------------------------------------------------
+        cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+        tScS = thr_mma_qk.partition_C(cS)[(None, None), 0, 0]
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+        
+        # tSrS_t2r is your loaded score fragment
+        
         if const_expr(col_bias is not None):
-            #self._add_col_bias(
-            #    tSrS_t2r, thr_mma_qk, col_bias,
-            #    batch_idx, head_idx, n_block, seqlen,
-            #)
             self._add_col_bias(
                 tSrS_t2r,
-                thr_tmem_load,
-                thr_mma_qk,
+                tScS_t2r,
                 col_bias,
                 batch_idx,
                 head_idx,
